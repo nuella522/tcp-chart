@@ -478,6 +478,7 @@ button{cursor:pointer}
 .composer textarea::placeholder{color:#9aa69e}
 .send-button{width:40px;height:40px;flex:0 0 auto;border:0;border-radius:12px;color:#fff;background:#218255;font-size:17px}
 .send-button:hover{background:#176c46}
+.send-button:disabled{cursor:not-allowed;opacity:.55;background:#90a99a}
 .composer-help{margin:7px 4px 0;color:#9aa69e;font-size:10px}
 .toast{position:fixed;right:22px;bottom:22px;z-index:5;max-width:min(380px,calc(100vw - 32px));padding:12px 16px;border:1px solid #f0d7d2;border-radius:12px;color:#8c3832;background:#fff;box-shadow:0 10px 32px #162c201c;font-size:13px}
 @media(max-width:760px){
@@ -536,7 +537,8 @@ button{cursor:pointer}
 <script>
 let ws = null, authMode = 'login', currentUser = '', activePeer = '';
 let conversationItems = [];
-let authPending = false, toastTimer = null;
+let authPending = false, conversationLoading = false, sendingMessage = false;
+let pendingMessageText = '', toastTimer = null;
 const authScreen = document.getElementById('auth-screen'), appScreen = document.getElementById('app-screen');
 const authForm = document.getElementById('auth-form'), usernameInput = document.getElementById('username');
 const passwordInput = document.getElementById('password'), authStatus = document.getElementById('auth-status');
@@ -619,8 +621,11 @@ function addChatMessage(message){
   messages.scrollTop = messages.scrollHeight;
 }
 function requestConversations(){
-  if(ws && ws.readyState === WebSocket.OPEN)
+  if(ws && ws.readyState === WebSocket.OPEN){
     ws.send(JSON.stringify({type:'conversations'}));
+    return true;
+  }
+  return false;
 }
 function setActivePeer(peer){
   activePeer = peer || '';
@@ -629,9 +634,16 @@ function setActivePeer(peer){
     ? activePeer.slice(0, 1).toUpperCase() : '?';
   document.getElementById('peer-status').textContent = activePeer
     ? 'One-to-one conversation' : 'Start a private chat using a username';
-  messageInput.disabled = !activePeer;
-  document.querySelector('#composer button[type="submit"]').disabled = !activePeer;
-  messageInput.placeholder = activePeer ? 'Write a message...' : 'Select a conversation first';
+  messageInput.disabled = !activePeer || conversationLoading;
+  document.querySelector('#composer button[type="submit"]').disabled =
+    !activePeer || conversationLoading || sendingMessage;
+  messageInput.placeholder = !activePeer ? 'Select a conversation first'
+    : conversationLoading ? 'Loading conversation...' : 'Write a message...';
+}
+function setSendingMessage(sending){
+  sendingMessage = sending;
+  document.querySelector('#composer button[type="submit"]').disabled =
+    !activePeer || conversationLoading || sendingMessage;
 }
 function renderConversations(items){
   conversationList.replaceChildren();
@@ -683,17 +695,31 @@ function renderConversations(items){
   });
 }
 function openConversation(peer){
+  if(!ws || ws.readyState !== WebSocket.OPEN){
+    showToast('Connection lost. Please log in again before opening a chat.');
+    return false;
+  }
+  try{
+    ws.send(JSON.stringify({type:'history', with:peer, limit:50}));
+  }catch(error){
+    showToast('Could not open the conversation. Please try again.');
+    return false;
+  }
   appScreen.classList.remove('show-sidebar');
   document.getElementById('mobile-conversations').setAttribute('aria-expanded', 'false');
+  conversationLoading = true;
   activePeer = peer;
   setActivePeer(peer);
   renderConversations(conversationItems);
   messages.replaceChildren();
   addSystemMessage('Loading conversation...');
-  ws.send(JSON.stringify({type:'history', with:peer, limit:50}));
+  return true;
 }
 function showChat(username){
   currentUser = username;
+  conversationLoading = false;
+  sendingMessage = false;
+  pendingMessageText = '';
   document.getElementById('profile-name').textContent = username;
   document.getElementById('profile-avatar').textContent = username.slice(0, 1).toUpperCase();
   authScreen.classList.add('hidden');
@@ -708,6 +734,9 @@ function showChat(username){
 function showLogin(message){
   currentUser = '';
   activePeer = '';
+  conversationLoading = false;
+  sendingMessage = false;
+  pendingMessageText = '';
   setActivePeer('');
   appScreen.classList.add('hidden');
   appScreen.classList.remove('show-sidebar');
@@ -737,6 +766,7 @@ function handleMessage(message){
     renderConversations(conversationItems);
   }else if(message.type === 'history_result'){
     if(message.with.toLowerCase() !== activePeer.toLowerCase()) return;
+    conversationLoading = false;
     activePeer = message.with;
     setActivePeer(activePeer);
     renderConversations(conversationItems);
@@ -753,6 +783,15 @@ function handleMessage(message){
     else showToast('New message from ' + message.from);
     requestConversations();
   }else if(message.type === 'dm_sent'){
+    if(sendingMessage){
+      if(message.to.toLowerCase() === activePeer.toLowerCase()
+          && message.text === pendingMessageText
+          && messageInput.value === pendingMessageText){
+        messageInput.value = '';
+      }
+      pendingMessageText = '';
+      setSendingMessage(false);
+    }
     if(message.to.toLowerCase() === activePeer.toLowerCase())
       addChatMessage({...message, from:currentUser});
     requestConversations();
@@ -771,8 +810,15 @@ function handleMessage(message){
     }else if(message.reason.startsWith('session expired')){
       showLogin('Your session expired. Please log in again.');
     }else{
-      if(message.reason === 'user not found' || message.reason === 'invalid conversation username'){
+      if(conversationLoading){
+        conversationLoading = false;
         setActivePeer('');
+      }
+      if(sendingMessage){
+        pendingMessageText = '';
+        setSendingMessage(false);
+      }
+      if(message.reason === 'user not found' || message.reason === 'invalid conversation username'){
         showEmptyChat('Conversation not found.', 'Check the username and try again.');
       }
       showToast(message.reason);
@@ -837,16 +883,28 @@ document.getElementById('new-chat-form').addEventListener('submit', event => {
     showToast('Enter a username with 3-16 letters, numbers, or underscores.');
     return;
   }
-  newPeerInput.value = '';
-  openConversation(peer);
+  if(openConversation(peer)) newPeerInput.value = '';
 });
 document.getElementById('composer').addEventListener('submit', event => {
   event.preventDefault();
   const text = messageInput.value.trim();
-  if(!text || !activePeer || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({type:'dm', to:activePeer, text}));
-  messageInput.value = '';
-  messageInput.focus();
+  if(!text) return;
+  if(!activePeer || conversationLoading){
+    showToast('Open a conversation before sending a message.');
+    return;
+  }
+  if(sendingMessage) return;
+  if(!ws || ws.readyState !== WebSocket.OPEN){
+    showToast('Connection lost. Please log in again. Your message is still here.');
+    return;
+  }
+  try{
+    ws.send(JSON.stringify({type:'dm', to:activePeer, text}));
+    pendingMessageText = text;
+    setSendingMessage(true);
+  }catch(error){
+    showToast('Message was not sent. Your text is still here; please try again.');
+  }
 });
 messageInput.addEventListener('keydown', event => {
   if(event.key === 'Enter' && !event.shiftKey){
