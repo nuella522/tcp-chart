@@ -25,11 +25,13 @@ Environment variables:
 | `WEB_PORT` | `8080` | Browser and WebSocket listener; set to `0` to disable |
 | `CHAT_DB_PATH` | `chat.sqlite3` | SQLite database file |
 | `SESSION_TTL_SECONDS` | `86400` | Session lifetime |
+| `CHAT_HEARTBEAT_SECONDS` | `25` | Interval between keep-alive pings |
+| `CLIENT_IDLE_TIMEOUT_SECONDS` | `300` | Disconnect clients that do not answer heartbeats |
 
 The terminal client starts with a numbered account menu. Choose "Create
-account" or "Log in"; password input is hidden. Once signed in, `/dm <user>
-<text>` sends a private message, `/history <user>` reads that conversation,
-and `/chats` lists your conversations. Plain text remains the legacy shared
+account" or "Log in"; password input is hidden. Once signed in, `/dm <user> <text>`
+sends a private message, `/history <user>` reads that conversation, and
+`/chats` lists your conversations. Plain text remains the legacy shared
 room; use `/dm` for private messages. `/logout`, `/quit`, and `/help` are also
 available.
 
@@ -38,7 +40,7 @@ conversation list. Enter a username to start a conversation. Both clients use
 the same server protocol. A message sent while the recipient is offline is
 stored and delivered when they next log in.
 
-## Stage A protocol
+## Protocol
 
 Every TCP request is one JSON object followed by `\n`. Browser WebSocket text
 frames carry the same JSON objects.
@@ -54,13 +56,15 @@ frames carry the same JSON objects.
 | `msg` | Client/server | Client: `text`; server adds `from`, `ts` | `{"type":"msg","text":"hello"}` | Authentication required; invalid/oversized text |
 | `dm` | Client -> server; server -> recipient | Client: `to`, `text`; server supplies `from`, IDs, time and status | `{"type":"dm","to":"bob","text":"hello"}` | Invalid/unknown recipient; invalid text |
 | `dm_sent` | Server -> sender | `message_id`, `conversation_id`, `to`, `text`, `ts`, `status` | `{"type":"dm_sent","to":"bob","text":"hello","status":"pending"}` | Returned as `error` if rejected |
+| `delivery_status` | Server -> sender | `message_id`, `status` | `{"type":"delivery_status","message_id":12,"status":"delivered"}` | Sent when a pending DM is delivered |
 | `history` | Client -> server | `with`, optional `limit` (1-100) | `{"type":"history","with":"bob"}` | Invalid username/limit; conversation not found |
-| `history_result` | Server -> client | `conversation_id`, `with`, `messages` | `{"type":"history_result","with":"bob","messages":[]}` | — |
+| `history_result` | Server -> client | `conversation_id`, `with`, `messages` | `{"type":"history_result","with":"bob","messages":[]}` | None |
 | `conversations` | Client -> server | None | `{"type":"conversations"}` | Authentication required |
-| `conversations_result` | Server -> client | `conversations` | `{"type":"conversations_result","conversations":[]}` | — |
+| `conversations_result` | Server -> client | `conversations` | `{"type":"conversations_result","conversations":[]}` | None |
 | `users` | Client -> server; server responds | None; response has `users` | `{"type":"users"}` | Authentication required |
 | `quit` | Client -> server | None | `{"type":"quit"}` | Closes connection |
-| `ping` | Server -> client | None | `{"type":"ping"}` | Keepalive; clients may ignore |
+| `ping` | Server -> client | None | `{"type":"ping"}` | Keepalive; clients should respond with `pong` |
+| `pong` | Client -> server | None | `{"type":"pong"}` | Keepalive response |
 | `error` | Server -> client | `reason` | `{"type":"error","reason":"authentication required"}` | Returned for invalid or unauthorized requests |
 
 Usernames are 3–16 ASCII letters, digits, or underscores and are unique
@@ -74,6 +78,11 @@ current protocol binds authentication to that TCP/WebSocket connection; later
 requests do not send the token again. Only a hash of the token is stored in
 SQLite, and disconnect/logout revokes the session. Identity on messages comes
 from the server-side session, not a client-supplied `from` field.
+
+Messages are inserted with `pending` status. The server marks a message
+`delivered` after successfully sending it to the recipient, either while
+online or at their next login. History returns the stored status. This is a
+delivery status only; read receipts are not implemented.
 
 ## Security limitation
 

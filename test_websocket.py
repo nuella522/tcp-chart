@@ -6,7 +6,8 @@ import base64, json, os, socket, struct, subprocess, sys, tempfile, time, urllib
 TCP_PORT, WEB_PORT = 5091, 8091
 temp_dir = tempfile.TemporaryDirectory()
 env = dict(os.environ, CHAT_PORT=str(TCP_PORT), WEB_PORT=str(WEB_PORT),
-           CHAT_DB_PATH=os.path.join(temp_dir.name, "chat.sqlite3"))
+           CHAT_DB_PATH=os.path.join(temp_dir.name, "chat.sqlite3"),
+           CHAT_HEARTBEAT_SECONDS="0.1", CLIENT_IDLE_TIMEOUT_SECONDS="0.6")
 srv = subprocess.Popen([sys.executable, "server.py"], env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(1)
@@ -25,6 +26,9 @@ class TcpClient:
             while b"\n" in self.buf:
                 line, _, self.buf = self.buf.partition(b"\n")
                 m = json.loads(line)
+                if m.get("type") == "ping":
+                    self.send({"type": "pong"})
+                    continue
                 if pred(m): return m
             self.buf += self.s.recv(4096)
 
@@ -66,7 +70,19 @@ class WsClient:
     def wait(self, pred):
         while True:
             m = self.recv_msg()
+            if m.get("type") == "ping":
+                self.send({"type": "pong"})
+                continue
             if pred(m): return m
+    def service_heartbeats(self, duration):
+        deadline = time.monotonic() + duration
+        count = 0
+        while time.monotonic() < deadline:
+            message = self.recv_msg()
+            if message.get("type") == "ping":
+                self.send({"type": "pong"})
+                count += 1
+        return count
 
 
 try:
@@ -91,6 +107,11 @@ try:
     assert w.wait(lambda m: m["type"] == "registered")["username"] == "webuser"
     w.send({"type": "login", "username": "webuser", "password": "test-password-123"})
     assert w.wait(lambda m: m["type"] == "login_ok")["username"] == "webuser"
+    assert w.service_heartbeats(1.5) >= 3
+    w.send({"type": "conversations"})
+    assert w.wait(lambda m: m["type"] == "conversations_result")
+    print("PASS WebSocket heartbeat keeps idle session connected")
+
     t = TcpClient("tcpuser")
     w.wait(lambda m: m.get("text") == "tcpuser joined")
     print("PASS browser and TCP clients share one room")

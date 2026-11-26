@@ -131,6 +131,8 @@ try:
     delivered = bob.wait(lambda m: m.get("type") == "dm")
     assert delivered["text"] == "Stored while you were away"
     assert delivered["from"] == "alice" and delivered["status"] == "delivered"
+    status_update = alice.wait(lambda m: m.get("type") == "delivery_status")
+    assert status_update["message_id"] == sent["message_id"]
     bob.send({"type": "history", "with": "alice"})
     bob_history = bob.wait(lambda m: m.get("type") == "history_result")
     assert bob_history["messages"][0]["status"] == "delivered"

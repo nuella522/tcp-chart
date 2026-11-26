@@ -11,10 +11,12 @@ host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
 auth_responses = queue.Queue()
 auth_waiting = threading.Event()
+send_lock = threading.Lock()
 
 
 def send(sock, obj):
-    sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+    with send_lock:
+        sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
 def receiver(sock):
@@ -33,7 +35,9 @@ def receiver(sock):
                 except ValueError:
                     continue
                 t = m.get("type")
-                if auth_waiting.is_set() and (
+                if t == "ping":
+                    send(sock, {"type": "pong"})
+                elif auth_waiting.is_set() and (
                     t in ("registered", "login_ok", "logged_out") or t == "error"
                 ):
                     auth_responses.put(m)
@@ -43,6 +47,8 @@ def receiver(sock):
                     print(f"[DM {m['from']} -> {m['to']}] {m['text']}")
                 elif t == "dm_sent":
                     print(f"[You -> {m['to']}] {m['text']} ({m['status']})")
+                elif t == "delivery_status":
+                    print(f"* Your message {m['message_id']} was delivered.")
                 elif t == "history_result":
                     print(f"* Conversation with {m['with']}:")
                     for item in m["messages"]:

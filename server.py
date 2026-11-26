@@ -29,7 +29,8 @@ WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))   # browser page + WebSocket 
 DB_PATH = os.environ.get("CHAT_DB_PATH", "chat.sqlite3")
 SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 MAX_LINE = 4096          # max bytes per framed message (protects against memory abuse)
-HEARTBEAT = 25           # seconds between keep-alive pings sent to every client
+HEARTBEAT = float(os.environ.get("CHAT_HEARTBEAT_SECONDS", "25"))
+CLIENT_IDLE_TIMEOUT = float(os.environ.get("CLIENT_IDLE_TIMEOUT_SECONDS", "300"))
 MAX_TEXT = 1000          # max chat text length
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 PASSWORD_MIN = 10
@@ -37,6 +38,8 @@ PASSWORD_MAX = 128
 
 if SESSION_TTL <= 0:
     raise ValueError("SESSION_TTL_SECONDS must be greater than zero")
+if HEARTBEAT <= 0 or CLIENT_IDLE_TIMEOUT <= HEARTBEAT:
+    raise ValueError("heartbeat must be positive and shorter than the client idle timeout")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,6 +101,12 @@ def untrack_client(username_key, sock):
                     clients.pop(username_key, None)
 
 
+def connected_sockets(username_key):
+    prune_expired_clients()
+    with clients_lock:
+        return list(clients.get(username_key, ()))
+
+
 def deliver_pending(username_key, sock):
     for item in message_store.pending_for(username_key):
         event = {
@@ -112,6 +121,12 @@ def deliver_pending(username_key, sock):
         }
         if send(sock, event):
             message_store.mark_delivered(item["message_id"], username_key)
+            for sender_sock in connected_sockets(item["from_key"]):
+                send(sender_sock, {
+                    "type": "delivery_status",
+                    "message_id": item["message_id"],
+                    "status": "delivered",
+                })
         else:
             break
 
@@ -153,7 +168,7 @@ def handle_client(sock, addr):
     username_key = None
     session_hash = None
     log.info("CONNECT %s:%s", *addr)
-    sock.settimeout(300)   # drop idle/dead clients after 5 minutes
+    sock.settimeout(CLIENT_IDLE_TIMEOUT)
     try:
         for raw in read_messages(sock, b""):
             try:
@@ -218,6 +233,9 @@ def handle_client(sock, addr):
                 log.info("LOGIN_SUCCESS username=%s from %s:%s", username_key, *addr)
                 continue
 
+            if mtype == "pong":
+                continue
+
             if mtype == "logout":
                 if session_hash is None:
                     send(sock, {"type": "error", "reason": "authentication required"})
@@ -275,9 +293,7 @@ def handle_client(sock, addr):
                     send(sock, {"type": "error", "reason": str(exc)})
                     continue
 
-                prune_expired_clients()
-                with clients_lock:
-                    targets = list(clients.get(saved["to_key"], ()))
+                targets = connected_sockets(saved["to_key"])
                 delivered = False
                 event = {
                     "type": "dm",
@@ -478,7 +494,7 @@ button{cursor:pointer}
   <div class="auth-card">
     <aside class="auth-brand">
       <div class="brand-mark"><span class="brand-icon" aria-hidden="true">T</span><span>TCP Chat</span></div>
-      <div class="brand-copy"><h1>Good conversations start here.</h1><p>A simple, secure place to connect. Sign in to join the community chat.</p></div>
+      <div class="brand-copy"><h1>Good conversations start here.</h1><p>A simple place to connect. Sign in to start a private conversation.</p></div>
       <p class="brand-foot">One account works in the browser and the terminal client.</p>
     </aside>
     <main class="auth-panel">
@@ -576,6 +592,8 @@ function addChatMessage(message){
   const row = document.createElement('div');
   const mine = message.from.toLowerCase() === currentUser.toLowerCase();
   row.className = 'message-row' + (mine ? ' mine' : '');
+  const messageId = message.message_id || message.id;
+  if(messageId !== undefined) row.dataset.messageId = String(messageId);
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   if(!mine){
@@ -591,6 +609,7 @@ function addChatMessage(message){
   time.className = 'message-time';
   const sentTime = new Date((message.ts || Date.now() / 1000) * 1000)
     .toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  row.dataset.sentTime = sentTime;
   time.textContent = mine && message.status
     ? sentTime + ' · ' + (message.status === 'pending' ? 'Pending delivery' : 'Delivered')
     : sentTime;
@@ -697,7 +716,10 @@ function showLogin(message){
   if(message) setAuthStatus(message, false);
 }
 function handleMessage(message){
-  if(message.type === 'registered'){
+  if(message.type === 'ping'){
+    if(ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({type:'pong'}));
+  }else if(message.type === 'registered'){
     authPending = false;
     authSubmit.disabled = false;
     setAuthMode('login');
@@ -734,6 +756,13 @@ function handleMessage(message){
     if(message.to.toLowerCase() === activePeer.toLowerCase())
       addChatMessage({...message, from:currentUser});
     requestConversations();
+  }else if(message.type === 'delivery_status'){
+    const row = Array.from(messages.querySelectorAll('.message-row'))
+      .find(item => item.dataset.messageId === String(message.message_id));
+    if(row){
+      const time = row.querySelector('.message-time');
+      time.textContent = row.dataset.sentTime + ' · Delivered';
+    }
   }else if(message.type === 'error'){
     if(authPending){
       authPending = false;
@@ -1010,8 +1039,7 @@ def serve_web():
 def heartbeat():
     """Send a small {"type": "ping"} to every client at a fixed interval.
 
-    Cloud proxies close connections that carry no data for a while (idle timeout).
-    A steady trickle of traffic keeps them open. Clients simply ignore the ping.
+    Clients reply with {"type": "pong"} so idle connections stay active.
     """
     while True:
         time.sleep(HEARTBEAT)

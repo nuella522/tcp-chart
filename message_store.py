@@ -212,7 +212,8 @@ class MessageStore:
                 raise UnknownUser
             rows = db.execute(
                 """SELECT messages.id, messages.conversation_id, sender.username,
-                          recipient.username, messages.body, messages.created_at
+                          sender.username_key, recipient.username,
+                          messages.body, messages.created_at
                    FROM messages
                    JOIN conversation_members AS recipient_member
                      ON recipient_member.conversation_id = messages.conversation_id
@@ -225,7 +226,7 @@ class MessageStore:
             ).fetchall()
             return [
                 {"message_id": row[0], "conversation_id": row[1], "from": row[2],
-                 "to": row[3], "text": row[4], "ts": row[5]}
+                 "from_key": row[3], "to": row[4], "text": row[5], "ts": row[6]}
                 for row in rows
             ]
 
